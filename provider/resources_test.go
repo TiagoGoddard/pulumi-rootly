@@ -149,3 +149,45 @@ func TestMuxedProviderRoutesAPIRequests(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, diff.Replaces, "migrating a v3 rotation must not replace it")
 }
+
+// Regression test for https://github.com/rootlyhq/pulumi-rootly/issues/161.
+func TestAlertsSourceResolutionRuleHasNoPermanentDiff(t *testing.T) {
+	ctx := context.Background()
+	info, data := testProvider(t)
+	server, err := pfbridge.MakeMuxedServer(ctx, "rootly", info, data)(nil)
+	require.NoError(t, err)
+	urn := "urn:pulumi:test::test::rootly:index/alertsSource:AlertsSource::example"
+	news, err := structpb.NewStruct(map[string]any{
+		"name":                   "example",
+		"sourceType":             "generic_webhook",
+		"deduplicateAlertsByKey": true,
+		"deduplicationKeyKind":   "payload",
+		"deduplicationKeyPath":   "$.id",
+		"resolutionRuleAttributes": map[string]any{
+			"enabled":                 true,
+			"conditionType":           "all",
+			"identifierReferenceKind": "payload",
+			"identifierJsonPath":      "$.id",
+			"conditionsAttributes": []any{
+				map[string]any{"kind": "payload", "field": "$.state", "operator": "is", "value": "resolved"},
+			},
+		},
+	})
+	require.NoError(t, err)
+	checked, err := server.Check(ctx, &pulumirpc.CheckRequest{Urn: urn, News: news})
+	require.NoError(t, err)
+	require.Empty(t, checked.Failures)
+	rule := checked.Inputs.AsMap()["resolutionRuleAttributes"].(map[string]any)
+	require.NotContains(t, rule, "identifierMatchableType", "the provider must not default identifierMatchableType")
+
+	// The API stores null when the identifier comes from the payload.
+	old := checked.Inputs.AsMap()
+	old["id"] = "source-1"
+	oldState, err := structpb.NewStruct(old)
+	require.NoError(t, err)
+	diff, err := server.Diff(ctx, &pulumirpc.DiffRequest{
+		Urn: urn, Id: "source-1", Olds: oldState, News: checked.Inputs,
+	})
+	require.NoError(t, err)
+	require.Equal(t, pulumirpc.DiffResponse_DIFF_NONE, diff.Changes, "diffs: %v", diff.Diffs)
+}
